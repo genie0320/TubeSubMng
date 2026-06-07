@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "Tube Manager",
+  "version": "1.0.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA7i4gKNE2K+E08PSjNEpdEngdF3/IiXG4dFCRCiUubg6OhxXa7t22o6BtYr0zbGitWH5MkfPPNqdVyLocXEo8BZRv3T3lw3BU4jWProFerWqVrFGveYva5NZ+245cDDqFT1JmDyuP6ZaApL+UMwhThsr2chfH7fSwg9FLbFp8c3UTggbUzt2kIld/az2/nSsv2FHgIbIrodvnrkdDZAze8tBzJEXd7YIKEDgTyGfbBZBHrjRXGuqs293VYTdKMJI9j3Qn0DOxt7t7Hk6spZkjGif8IgA7AgiASQEdF10c/RACUBZTe1qQVakpbR3z5OAHeeKSgFaRJNbnZhcw4wrFQQIDAQAB",
+  "description": "YouTube Channel Sync & Topic Mapping Engine",
+  "permissions": [
+    "identity",
+    "storage",
+    "declarativeNetRequest",
+    "alarms"
+  ],
+  "host_permissions": [
+    "https://www.googleapis.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "oauth2": {
+    "client_id": "733686128763-hhnk6t5ff0om5if9ma21efd23ok18sfu.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/youtube"
+    ]
+  },
+  "action": {
+    "default_popup": "popup/popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.youtube.com/*"
+      ],
+      "js": [
+        "content.js"
+      ]
+    }
+  ]
+}
