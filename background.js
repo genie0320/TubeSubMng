@@ -17,13 +17,86 @@ const YOUTUBE_GUIDE_CATEGORIES = {
   "GC15": "비영리/사회운동"
 };
 
+// State management for per-account isolation
+const state = {
+  activeOwnerId: '',
+  activeUserEmail: '',
+  activeChannelTitle: ''
+};
+let memorySessionToken = null;
+
+// Registry helper to record account metadata in storage
+async function updateAccountLedger(channelId, email, channelTitle) {
+  if (!channelId || channelId === 'default_user' || channelId === 'sample_user') return;
+  const data = await chrome.storage.local.get(['account_registry']);
+  const account_registry = data.account_registry || [];
+  const existingIndex = account_registry.findIndex(a => a.channelId === channelId);
+  const accountData = {
+    channelId,
+    channelTitle: channelTitle || email.split('@')[0],
+    email: email || '',
+    lastSyncTimestamp: Date.now()
+  };
+  if (existingIndex > -1) {
+    // Preserve existing email if new is empty
+    if (!accountData.email && account_registry[existingIndex].email) {
+      accountData.email = account_registry[existingIndex].email;
+    }
+    account_registry[existingIndex] = accountData;
+  } else {
+    account_registry.push(accountData);
+  }
+  await chrome.storage.local.set({ account_registry });
+}
+
+// Resolve the logged-in User Channel ID via YouTube API or local storage fallback
+async function resolveActiveOwnerId() {
+  if (state.activeOwnerId) return state.activeOwnerId;
+  
+  const stored = await chrome.storage.local.get(['activeOwnerId', 'activeUserEmail', 'activeChannelTitle']);
+  if (stored.activeOwnerId) {
+    state.activeOwnerId = stored.activeOwnerId;
+    state.activeUserEmail = stored.activeUserEmail || '';
+    state.activeChannelTitle = stored.activeChannelTitle || '';
+    return state.activeOwnerId;
+  }
+  
+  try {
+    const data = await fetchYouTubeAPI('https://www.googleapis.com/youtube/v3/channels?part=id,snippet&mine=true', false);
+    if (data && data.items && data.items.length > 0) {
+      const channelId = data.items[0].id;
+      const channelTitle = data.items[0].snippet?.title || '';
+      if (channelId) {
+        state.activeOwnerId = channelId;
+        state.activeChannelTitle = channelTitle;
+        await chrome.storage.local.set({ 
+          activeOwnerId: channelId, 
+          activeChannelTitle: channelTitle 
+        });
+        // Persist current in-memory token to L2 cache now that channelId is known
+        if (memorySessionToken) {
+          await persistToken(memorySessionToken, channelId);
+        }
+        await updateAccountLedger(channelId, state.activeUserEmail, channelTitle);
+        return state.activeOwnerId;
+      }
+    }
+  } catch (err) {
+    console.warn("Failed to fetch activeOwnerId from YouTube API:", err);
+  }
+  
+  state.activeOwnerId = 'default_user';
+  return state.activeOwnerId;
+}
+
 // IndexedDB Setup
-const DB_NAME = 'TubeManagerDB';
 const DB_VERSION = 4;
 
-function openDB() {
+async function openDB(ownerId) {
+  const targetOwnerId = ownerId || await resolveActiveOwnerId();
+  const dbName = `TubeManagerDB_${targetOwnerId}`;
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    const request = indexedDB.open(dbName, DB_VERSION);
     
     request.onerror = () => {
       console.error("IndexedDB open error:", request.error);
@@ -78,8 +151,8 @@ function openDB() {
 }
 
 // Transaction Helpers
-function getAllFromStore(storeName) {
-  return openDB().then(db => {
+function getAllFromStore(storeName, ownerId) {
+  return openDB(ownerId).then(db => {
     return new Promise((resolve, reject) => {
       const tx = db.transaction([storeName], 'readonly');
       const store = tx.objectStore(storeName);
@@ -96,8 +169,8 @@ function getAllFromStore(storeName) {
   });
 }
 
-function saveToStore(storeName, dataArray) {
-  return openDB().then(db => {
+function saveToStore(storeName, dataArray, ownerId) {
+  return openDB(ownerId).then(db => {
     return new Promise((resolve, reject) => {
       const tx = db.transaction([storeName], 'readwrite');
       const store = tx.objectStore(storeName);
@@ -130,14 +203,127 @@ function saveToStore(storeName, dataArray) {
   });
 }
 
-// OAuth Token acquisition
-function getAuthToken(interactive = false) {
+// ============================================================
+// [Token Persistence Cache] — 3-Layer Auth Architecture
+// L1: memorySessionToken (in-process, fastest)
+// L2: chrome.storage.local.active_tokens (1-hour persistent)
+// L3: launchWebAuthFlow (only when L1+L2 both miss/expired)
+// ============================================================
+
+async function loadCachedToken(channelId) {
+  // Resolve channelId from storage if not yet known in-process
+  let targetId = channelId;
+  if (!targetId || targetId === 'default_user' || targetId === 'sample_user') {
+    const stored = await chrome.storage.local.get(['activeOwnerId']);
+    targetId = stored.activeOwnerId || '';
+  }
+  if (!targetId || targetId === 'default_user' || targetId === 'sample_user') return null;
+  try {
+    const data = await chrome.storage.local.get(['active_tokens']);
+    const tokens = data.active_tokens || {};
+    const entry = tokens[targetId];
+    if (entry && entry.token && Date.now() < entry.expire_at) {
+      console.log(`[TokenCache] L2 hit for ${targetId} — expires in ${Math.round((entry.expire_at - Date.now()) / 60000)}m`);
+      return entry.token;
+    }
+    return null;
+  } catch (e) {
+    console.warn('[TokenCache] loadCachedToken error:', e);
+    return null;
+  }
+}
+
+async function persistToken(token, channelId) {
+  if (!channelId || channelId === 'default_user' || channelId === 'sample_user') return;
+  try {
+    const data = await chrome.storage.local.get(['active_tokens']);
+    const tokens = data.active_tokens || {};
+    tokens[channelId] = { token, expire_at: Date.now() + 3_600_000 };
+    await chrome.storage.local.set({ active_tokens: tokens });
+    console.log(`[TokenCache] L2 persisted for ${channelId} — valid 1hr`);
+  } catch (e) {
+    console.warn('[TokenCache] persistToken error:', e);
+  }
+}
+
+async function evictCachedToken(channelId) {
+  if (!channelId || channelId === 'default_user' || channelId === 'sample_user') return;
+  try {
+    const data = await chrome.storage.local.get(['active_tokens']);
+    const tokens = data.active_tokens || {};
+    if (tokens[channelId]) {
+      delete tokens[channelId];
+      await chrome.storage.local.set({ active_tokens: tokens });
+      console.log(`[TokenCache] L2 evicted for ${channelId}`);
+    }
+  } catch (e) {
+    console.warn('[TokenCache] evictCachedToken error:', e);
+  }
+}
+
+// OAuth Token acquisition — 3-layer cache lookup
+async function getAuthToken(interactive = false) {
+  // L1: in-memory fast path (within same SW lifecycle)
+  if (memorySessionToken) {
+    return memorySessionToken;
+  }
+
+  // L2: persistent token cache (survives SW restart)
+  const cachedToken = await loadCachedToken(state.activeOwnerId);
+  if (cachedToken) {
+    memorySessionToken = cachedToken;
+    return cachedToken;
+  }
+
+  // L3: full OAuth web flow — only when both caches miss
   return new Promise((resolve, reject) => {
-    chrome.identity.getAuthToken({ interactive }, (token) => {
+    const clientId = '541710232861-65gncvlhfcsdvh9seg6hpuurkmnojf19.apps.googleusercontent.com';
+    const redirectUri = encodeURIComponent(chrome.identity.getRedirectURL());
+    const scope = encodeURIComponent([
+      'https://www.googleapis.com/auth/youtube.readonly',
+      'https://www.googleapis.com/auth/youtube.force-ssl',
+      'https://www.googleapis.com/auth/userinfo.email'
+    ].join(' '));
+    const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${clientId}&response_type=token&redirect_uri=${redirectUri}&scope=${scope}&prompt=select_account`;
+
+    chrome.identity.launchWebAuthFlow({ url: authUrl, interactive: true }, (redirectUrl) => {
       if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
-      } else {
-        resolve(token);
+        return reject(new Error(chrome.runtime.lastError.message));
+      }
+      if (!redirectUrl) {
+        return reject(new Error('Web authorization flow failed.'));
+      }
+      
+      try {
+        const urlObj = new URL(redirectUrl);
+        const params = new URLSearchParams(urlObj.hash.substring(1));
+        const token = params.get('access_token');
+        if (token) {
+          memorySessionToken = token;
+          // Note: token is persisted to L2 inside resolveActiveOwnerId()
+          // after channelId is confirmed, to avoid keying on empty string.
+          
+          fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+            headers: { 'Authorization': `Bearer ${token}` }
+          })
+          .then(r => r.json())
+          .then(async (userinfo) => {
+            if (userinfo && userinfo.email) {
+              state.activeUserEmail = userinfo.email;
+              await chrome.storage.local.set({ activeUserEmail: userinfo.email });
+              await updateAccountLedger(state.activeOwnerId, userinfo.email, state.activeChannelTitle);
+            }
+            resolve(token);
+          })
+          .catch((err) => {
+            console.error('Failed to fetch userinfo email:', err);
+            resolve(token);
+          });
+        } else {
+          reject(new Error('Access token not found in redirection URL.'));
+        }
+      } catch (err) {
+        reject(err);
       }
     });
   });
@@ -160,18 +346,12 @@ async function fetchYouTubeAPI(url, interactive = false) {
     }
   });
 
-  if (response.status === 401) {
-    await new Promise((resolve) => chrome.identity.removeCachedAuthToken({ token }, resolve));
-    token = await getAuthToken(true);
-    response = await fetch(url, {
-      headers: {
-        'Authorization': `Bearer ${token}`,
-        'Accept': 'application/json'
-      }
-    });
-  }
-
   if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      memorySessionToken = null;
+      // Evict stale token from L2 persistent cache
+      await evictCachedToken(state.activeOwnerId);
+    }
     const errorBody = await response.text().catch(() => '');
     throw new Error(`YouTube API HTTP error! Status: ${response.status}. Body: ${errorBody}`);
   }
@@ -180,7 +360,7 @@ async function fetchYouTubeAPI(url, interactive = false) {
 }
 
 // Ingest Subscriptions
-async function ingestSubscriptionsFromAPI() {
+async function ingestSubscriptionsFromAPI(ownerId) {
   console.log("Loading subscriptions via YouTube API...");
   let baseSubscriptions = [];
   let nextPageToken = '';
@@ -192,7 +372,7 @@ async function ingestSubscriptionsFromAPI() {
 
   try {
     do {
-      const url = `https://www.googleapis.com/youtube/v3/subscriptions?part=snippet&mine=true&maxResults=50${nextPageToken ? `&pageToken=${nextPageToken}` : ''}`;
+      const url = `https://www.googleapis.com/youtube/v3/subscriptions?part=snippet,contentDetails&mine=true&maxResults=50${nextPageToken ? `&pageToken=${nextPageToken}` : ''}`;
       const data = await fetchYouTubeAPI(url, true);
       
       if (data.items) {
@@ -209,7 +389,8 @@ async function ingestSubscriptionsFromAPI() {
               title,
               customUrl: '',
               subscribed_at,
-              syncedAt: new Date().toISOString()
+              syncedAt: new Date().toISOString(),
+              raw_api_payload: item
             });
           }
         }
@@ -221,13 +402,15 @@ async function ingestSubscriptionsFromAPI() {
       throw new Error('구독 중인 채널을 검색하지 못했습니다.');
     }
 
-    await saveToStore('youtube_subscriptions', baseSubscriptions);
+    await saveToStore('youtube_subscriptions', baseSubscriptions, ownerId);
 
     await chrome.storage.local.set({
       syncStatus: 'STEP1_COMPLETED',
       totalChannels: baseSubscriptions.length,
       timestamp: new Date().toISOString()
     });
+
+    await updateAccountLedger(ownerId, state.activeUserEmail, state.activeChannelTitle);
 
     return baseSubscriptions.length;
   } catch (err) {
@@ -241,13 +424,13 @@ async function ingestSubscriptionsFromAPI() {
 }
 
 // Sync Channel Metadata
-async function syncChannelMetadata() {
+async function syncChannelMetadata(ownerId) {
   const state = await chrome.storage.local.get(['syncStatus']);
   if (state.syncStatus !== 'STEP1_COMPLETED' && state.syncStatus !== 'STEP2_IN_PROGRESS' && state.syncStatus !== 'STEP2_FAILED') {
     throw new Error('1단계(마스터 구독 목록 확보)가 완료되어야 실행 가능합니다.');
   }
 
-  const subscriptions = await getAllFromStore('youtube_subscriptions');
+  const subscriptions = await getAllFromStore('youtube_subscriptions', ownerId);
   if (subscriptions.length === 0) {
     throw new Error('구독 목록 저장소가 비어 있습니다.');
   }
@@ -281,7 +464,7 @@ async function syncChannelMetadata() {
     console.log(`Step 2: Processing chunk ${i + 1}/${totalChunks}...`);
 
     let processedChannels = [];
-    const url = `https://www.googleapis.com/youtube/v3/channels?part=snippet,contentDetails,statistics,topicDetails,brandingSettings&id=${chunkIds.join(',')}`;
+    const url = `https://www.googleapis.com/youtube/v3/channels?part=snippet,contentDetails,statistics,topicDetails,brandingSettings,status,localizations&id=${chunkIds.join(',')}`;
     try {
       const data = await fetchYouTubeAPI(url, false);
       if (data.items) {
@@ -296,7 +479,6 @@ async function syncChannelMetadata() {
             description: item.snippet?.description || '',
             customUrl: item.snippet?.customUrl || '',
             thumbnail: item.snippet?.thumbnails?.high?.url || item.snippet?.thumbnails?.default?.url || '',
-            banner: item.brandingSettings?.image?.bannerExternalUrl || '',
             uploadsPlaylistId: item.contentDetails?.relatedPlaylists?.uploads || `UU${item.id.substring(2)}`,
             view_count: parseInt(item.statistics?.viewCount || '0', 10),
             subscriber_count: parseInt(item.statistics?.subscriberCount || '0', 10),
@@ -306,7 +488,8 @@ async function syncChannelMetadata() {
             subscribed_at: subMap.get(item.id) || Date.now(),
             syncedAt: new Date().toISOString(),
             last_synced_at: Date.now(),
-            status_flag: 'SUBSCRIBED'
+            status_flag: 'SUBSCRIBED',
+            raw_api_payload: item
           };
         });
       }
@@ -315,7 +498,7 @@ async function syncChannelMetadata() {
       throw err;
     }
 
-    await saveToStore('channels_master', processedChannels);
+    await saveToStore('channels_master', processedChannels, ownerId);
 
     await chrome.storage.local.set({
       syncStatus: 'STEP2_IN_PROGRESS',
@@ -334,8 +517,13 @@ async function syncChannelMetadata() {
   return totalChannels;
 }
 
-// Sync Latest Videos details
-async function syncLatestVideos() {
+// syncLatestVideos() has been removed.
+// Stage 3 RSS ingestion now runs directly inside dashboard.js
+// where DOMParser is available (full tab context, not SW).
+// See syncLatestVideosRSS() in dashboard.js.
+
+// Sync Latest Videos details — LEGACY STUB (kept for runSilentSync reference)
+async function syncLatestVideos(ownerId) {
   const state = await chrome.storage.local.get(['syncStatus']);
   const isAllowedStatus = [
     'STEP2_COMPLETED',
@@ -348,7 +536,7 @@ async function syncLatestVideos() {
     throw new Error('2단계(채널 세부정보 동기화)가 완료되어야 실행 가능합니다.');
   }
 
-  const channels = await getAllFromStore('channels_master');
+  const channels = await getAllFromStore('channels_master', ownerId);
   if (channels.length === 0) {
     throw new Error('채널 상세 정보 저장소가 비어 있습니다.');
   }
@@ -388,14 +576,14 @@ async function syncLatestVideos() {
 
       let videoItems = [];
       if (playlistId) {
-        const url = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId=${playlistId}&maxResults=3`;
+        const url = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails,status&playlistId=${playlistId}&maxResults=3`;
         try {
           const data = await fetchYouTubeAPI(url, false);
           if (data.items && data.items.length > 0) {
              const rawPublished = data.items[0].snippet?.publishedAt || data.items[0].contentDetails?.videoPublishedAt || '';
              const last_uploaded_at = rawPublished ? new Date(rawPublished).getTime() : Date.now();
               
-             const dbUpdate = await openDB();
+             const dbUpdate = await openDB(ownerId);
              const txCh = dbUpdate.transaction(['channels_master'], 'readwrite');
              const chStore = txCh.objectStore('channels_master');
              const chRecord = await new Promise((resolveCh) => {
@@ -420,7 +608,8 @@ async function syncLatestVideos() {
                  title: item.snippet?.title || '',
                  uploaded_at: vUploadedAt,
                  thumbnail: item.snippet?.thumbnails?.high?.url || item.snippet?.thumbnails?.default?.url || '',
-                 syncedAt: new Date().toISOString()
+                 syncedAt: new Date().toISOString(),
+                 raw_api_payload: item
                };
              });
           }
@@ -430,7 +619,7 @@ async function syncLatestVideos() {
       }
 
       if (videoItems.length > 0) {
-        await saveToStore('video_preview_cache', videoItems);
+        await saveToStore('video_preview_cache', videoItems, ownerId);
       }
       
     } catch (channelErr) {
@@ -450,11 +639,13 @@ async function syncLatestVideos() {
       syncStatus: 'STEP3_COMPLETED',
       timestamp: new Date().toISOString()
     });
+    await updateAccountLedger(ownerId, state.activeUserEmail, state.activeChannelTitle);
   } else {
     await chrome.storage.local.set({
       syncStatus: 'STEP3_PARTIAL_COMPLETED',
       timestamp: new Date().toISOString()
     });
+    await updateAccountLedger(ownerId, state.activeUserEmail, state.activeChannelTitle);
   }
 
   return endIndex - startIndex;
@@ -479,7 +670,7 @@ async function runSilentSync() {
       try {
         const chunk = subscriptions.slice(i * batchSize, (i + 1) * batchSize);
         const chunkIds = chunk.map(s => s.id);
-        const url = `https://www.googleapis.com/youtube/v3/channels?part=snippet,contentDetails,statistics,topicDetails,brandingSettings&id=${chunkIds.join(',')}`;
+        const url = `https://www.googleapis.com/youtube/v3/channels?part=snippet,contentDetails,statistics,topicDetails,brandingSettings,status,localizations&id=${chunkIds.join(',')}`;
         const data = await fetchYouTubeAPI(url, false);
         
         if (data.items) {
@@ -494,7 +685,6 @@ async function runSilentSync() {
               description: item.snippet?.description || '',
               customUrl: item.snippet?.customUrl || '',
               thumbnail: item.snippet?.thumbnails?.high?.url || item.snippet?.thumbnails?.default?.url || '',
-              banner: item.brandingSettings?.image?.bannerExternalUrl || '',
               uploadsPlaylistId: item.contentDetails?.relatedPlaylists?.uploads || `UU${item.id.substring(2)}`,
               view_count: parseInt(item.statistics?.viewCount || '0', 10),
               subscriber_count: parseInt(item.statistics?.subscriberCount || '0', 10),
@@ -504,7 +694,8 @@ async function runSilentSync() {
               subscribed_at: subMap.get(item.id) || Date.now(),
               syncedAt: new Date().toISOString(),
               last_synced_at: Date.now(),
-              status_flag: 'SUBSCRIBED'
+              status_flag: 'SUBSCRIBED',
+              raw_api_payload: item
             };
           });
           await saveToStore('channels_master', processed);
@@ -531,7 +722,7 @@ async function runSilentSync() {
       try {
         const playlistId = ch.uploadsPlaylistId;
         if (playlistId) {
-          const url = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId=${playlistId}&maxResults=3`;
+          const url = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet,contentDetails,status&playlistId=${playlistId}&maxResults=3`;
           const data = await fetchYouTubeAPI(url, false);
           if (data.items && data.items.length > 0) {
             const rawPublished = data.items[0].snippet?.publishedAt || data.items[0].contentDetails?.videoPublishedAt || '';
@@ -549,7 +740,8 @@ async function runSilentSync() {
                 title: item.snippet?.title || '',
                 uploaded_at: vUploadedAt,
                 thumbnail: item.snippet?.thumbnails?.high?.url || item.snippet?.thumbnails?.default?.url || '',
-                syncedAt: new Date().toISOString()
+                syncedAt: new Date().toISOString(),
+                raw_api_payload: item
               };
             });
             await saveToStore('video_preview_cache', videoItems);
@@ -586,7 +778,9 @@ async function executeActualDelete(channelId) {
     clearTimeout(activeTimers[channelId]);
     delete activeTimers[channelId];
   }
-  chrome.alarms.clear("delete_channel_" + channelId);
+  if (chrome.alarms) {
+    chrome.alarms.clear("delete_channel_" + channelId);
+  }
 
   console.log(`Executing actual subscription delete for channel: ${channelId}`);
   try {
@@ -682,12 +876,14 @@ async function executeActualDelete(channelId) {
   }
 }
 
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name.startsWith("delete_channel_")) {
-    const channelId = alarm.name.replace("delete_channel_", "");
-    executeActualDelete(channelId);
-  }
-});
+if (chrome.alarms) {
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name.startsWith("delete_channel_")) {
+      const channelId = alarm.name.replace("delete_channel_", "");
+      executeActualDelete(channelId);
+    }
+  });
+}
 
 async function cleanExpiredPendingDeletions() {
   try {
@@ -712,7 +908,9 @@ async function cleanExpiredPendingDeletions() {
           await executeActualDelete(ch.id);
         } else {
           const remainingSec = (5000 - elapsed) / 1000;
-          chrome.alarms.create("delete_channel_" + ch.id, { delayInMinutes: remainingSec / 60 });
+          if (chrome.alarms) {
+            chrome.alarms.create("delete_channel_" + ch.id, { delayInMinutes: remainingSec / 60 });
+          }
           
           if (activeTimers[ch.id]) clearTimeout(activeTimers[ch.id]);
           activeTimers[ch.id] = setTimeout(() => {
@@ -729,12 +927,332 @@ async function cleanExpiredPendingDeletions() {
 chrome.runtime.onStartup.addListener(cleanExpiredPendingDeletions);
 cleanExpiredPendingDeletions();
 
+// ============================================================
+// [Migration State Machine] — Persistent Background Queue
+// Decouples migration execution from the dashboard tab lifecycle.
+// chrome.alarms watchdog re-wakes the SW if Chrome kills it mid-run.
+// Queue stored in chrome.storage.local.migration_queue.
+// Schema: Array<{ id, title, status: 'pending'|'success'|'failed'|'skipped', ownerId }>
+// ============================================================
+
+async function processMigrationQueue() {
+  const { migration_queue = [] } = await chrome.storage.local.get(['migration_queue']);
+  const hasPending = migration_queue.some(item => item.status === 'pending');
+  if (!hasPending) {
+    // All done — cancel the watchdog alarm
+    chrome.alarms.clear('MIGRATION_QUEUE_WATCHDOG');
+    return;
+  }
+
+  for (let i = 0; i < migration_queue.length; i++) {
+    const item = migration_queue[i];
+    if (item.status !== 'pending') continue;
+
+    try {
+      const token = await getAuthToken(false);
+      const response = await fetch(
+        'https://www.googleapis.com/youtube/v3/subscriptions?part=snippet',
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            snippet: {
+              resourceId: { kind: 'youtube#channel', channelId: item.id }
+            }
+          })
+        }
+      );
+
+      if (response.status === 403) {
+        // Quota boundary — mark all remaining pending as failed, stop loop
+        console.warn('[MigrationQueue] HTTP 403 quota limit hit. Halting queue.');
+        for (let j = i; j < migration_queue.length; j++) {
+          if (migration_queue[j].status === 'pending') {
+            migration_queue[j].status = 'failed';
+          }
+        }
+        await chrome.storage.local.set({ migration_queue });
+        chrome.alarms.clear('MIGRATION_QUEUE_WATCHDOG');
+        try { chrome.runtime.sendMessage({ type: 'MIGRATION_QUOTA_EXCEEDED' }); } catch (_) {}
+        try {
+          chrome.runtime.sendMessage({ type: 'MIGRATION_QUEUE_UPDATE', queue: migration_queue });
+        } catch (_) {}
+        return;
+      } else if (response.status === 409) {
+        migration_queue[i].status = 'skipped';
+      } else if (response.ok) {
+        migration_queue[i].status = 'success';
+      } else {
+        const body = await response.text().catch(() => '');
+        console.warn(`[MigrationQueue] Status ${response.status} for ${item.id}:`, body);
+        migration_queue[i].status = 'failed';
+      }
+    } catch (itemErr) {
+      console.warn(`[MigrationQueue] Exception for ${item.id}:`, itemErr);
+      migration_queue[i].status = 'failed';
+    }
+
+    // Persist updated status after every item
+    await chrome.storage.local.set({ migration_queue });
+
+    // Broadcast live progress to dashboard if it is open
+    const done  = migration_queue.filter(q => q.status !== 'pending').length;
+    const total = migration_queue.length;
+    const successCount = migration_queue.filter(q => q.status === 'success').length;
+    try {
+      chrome.runtime.sendMessage({
+        type: 'MIGRATION_QUEUE_UPDATE',
+        queue: migration_queue,
+        done, total, successCount,
+        currentTitle: item.title || item.id
+      });
+    } catch (_) {}
+
+    // Strict 1500ms throttle between each POST
+    if (i < migration_queue.length - 1) {
+      const remaining = migration_queue.slice(i + 1).some(q => q.status === 'pending');
+      if (remaining) await new Promise(r => setTimeout(r, 1500));
+    }
+  }
+
+  // Loop complete — cancel watchdog alarm
+  chrome.alarms.clear('MIGRATION_QUEUE_WATCHDOG');
+  console.log('[MigrationQueue] Queue exhausted.');
+  try {
+    const finalQueue = migration_queue;
+    chrome.runtime.sendMessage({ type: 'MIGRATION_QUEUE_UPDATE', queue: finalQueue, done: finalQueue.length, total: finalQueue.length, successCount: finalQueue.filter(q => q.status === 'success').length });
+  } catch (_) {}
+}
+
+// ============================================================
+// [Ingestion Queue State Machine] — Persistent Background Scraper
+// Zero-API-quota hybrid scraper: ytInitialData regex + RSS entry regex.
+// Runs entirely in SW (no DOMParser). Survives tab close via chrome.alarms.
+// Storage key: chrome.storage.local.ingestion_queue
+// Schema: Array<{ id, handle, title, status: 'pending'|'processing'|'success'|'failed' }>
+// ============================================================
+
+async function processIngestionQueue() {
+  let { ingestion_queue = [] } = await chrome.storage.local.get(['ingestion_queue']);
+
+  // ── 1. Boot-time sanitizer: reset stuck 'processing' rows to 'pending' ──────
+  const stuckItems = ingestion_queue.filter(item => item.status === 'processing');
+  stuckItems.forEach(item => item.status = 'pending');
+  if (stuckItems.length > 0) {
+    await chrome.storage.local.set({ ingestion_queue });
+    console.log(`[Ingestion] Sanitized ${stuckItems.length} stuck 'processing' rows back to 'pending'.`);
+  }
+
+  const pendingItems = ingestion_queue.filter(i => i.status === 'pending');
+  if (pendingItems.length === 0) {
+    console.log('[Ingestion] Queue empty — clearing watchdog alarm.');
+    chrome.alarms.clear('INGESTION_QUEUE_WATCHDOG');
+    return;
+  }
+
+  // ── 2. Configuration Invariants ──────────────────────────────────────────
+  const CHUNK_SIZE = 8;
+  const STAGGER_MS = 150;
+  const INTER_CHUNK_MS = 200;
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const ownerId = state.activeOwnerId;
+
+  // ── 3. SW-Safe RSS Matcher & Parser (Single-pass XML regex ingestion) ──
+  async function fetchChannelRssData(channelId, signal) {
+    const url = `https://www.youtube.com/feeds/videos.xml?channel_id=${channelId}`;
+    const result = { lastUploadedAt: 0, videoPreviews: [] };
+    try {
+      const resp = await fetch(url, { cache: 'no-store', signal });
+      if (!resp.ok) return result;
+      const text = await resp.text();
+
+      // 1. Resolve authoritative timestamp of the absolute latest video entry
+      const entryMatch = text.match(/<entry>[\s\S]*?<published>([^<]+)<\/published>/);
+      if (entryMatch) {
+        const ts = new Date(entryMatch[1]).getTime();
+        if (!isNaN(ts)) result.lastUploadedAt = ts;
+      }
+
+      // 2. Extract top-3 video blocks sequentially for Cache Hydration
+      const entryBlockRegex = /<entry>([\s\S]*?)<\/entry>/g;
+      let entryMatchBlock;
+      let count = 0;
+
+      while ((entryMatchBlock = entryBlockRegex.exec(text)) !== null && count < 3) {
+        const blockContent = entryMatchBlock[1];
+        const idMatch = blockContent.match(/<yt:videoId>([^<]+)<\/yt:videoId>/);
+        const titleMatch = blockContent.match(/<title>([^<]+)<\/title>/);
+        const thumbMatch = blockContent.match(/<media:thumbnail\s+url="([^"]+)"/);
+        const dateMatch = blockContent.match(/<published>([^<]+)<\/published>/);
+
+        if (idMatch && titleMatch) {
+          const vDate = dateMatch ? new Date(dateMatch[1]).getTime() : Date.now();
+          result.videoPreviews.push({
+            id: idMatch[1],
+            target_channel_id: channelId,
+            title: titleMatch[1].replace(/<!\[CDATA\[|\]\]>/g, '').trim(),
+            uploaded_at: isNaN(vDate) ? Date.now() : vDate,
+            thumbnail: thumbMatch ? thumbMatch[1] : `https://i.ytimg.com/vi/${idMatch[1]}/hqdefault.jpg`
+          });
+          count++;
+        }
+      }
+      return result;
+    } catch (err) {
+      console.error("[RSS Engine Error]", err);
+      return result;
+    }
+  }
+
+  console.log(`[Ingestion Engine] Starting batch processing for ${pendingItems.length} pending channels.`);
+
+  // ── 4. Throttled Concurrency Ingestion Loop ──────────────────────────────
+  for (let i = 0; i < pendingItems.length; i += CHUNK_SIZE) {
+    // Re-verify active runtime state sync
+    const curQueueState = await chrome.storage.local.get(['ingestion_queue']);
+    const freshQueue = curQueueState.ingestion_queue || ingestion_queue;
+    
+    const chunk = pendingItems.slice(i, i + CHUNK_SIZE);
+    
+    // Atomically lock chunk rows to 'processing'
+    chunk.forEach(item => {
+      const target = freshQueue.find(q => q.id === item.id);
+      if (target) target.status = 'processing';
+    });
+    await chrome.storage.local.set({ ingestion_queue: freshQueue });
+
+    // Execute parallel fetch slots with a stagger launch delay
+    await Promise.all(chunk.map(async (item, slotIdx) => {
+      await sleep(slotIdx * STAGGER_MS);
+      
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 3000); // 3s Network parachute
+      
+      let resolvedTimestamp = 0;
+      let videoPreviews = [];
+
+      try {
+        // Phase 1: Authoritative RSS Data Map Ingest
+        const rssData = await fetchChannelRssData(item.id, controller.signal);
+
+        // Phase 2: Invariants Resolution
+        resolvedTimestamp = rssData.lastUploadedAt;
+        videoPreviews = rssData.videoPreviews;
+
+        // Phase 3: Synchronous Callback-Chain IDB Invariants Execution
+        const db = await openDB(ownerId);
+        const tx = db.transaction(['channels_master'], 'readwrite');
+        const store = tx.objectStore('channels_master');
+        
+        await new Promise((resResolve) => {
+          const getReq = store.get(item.id);
+          getReq.onsuccess = () => {
+            const record = getReq.result;
+            if (record) {
+              record.last_uploaded_at = resolvedTimestamp;
+              record.last_synced_at = Date.now();
+              store.put(record);
+            }
+            resResolve();
+          };
+          getReq.onerror = () => resResolve();
+        });
+        tx.oncomplete = () => db.close();
+        tx.onerror = () => db.close();
+
+        // Hydrate the preview store cache to eliminate modal emptiness
+        if (videoPreviews.length > 0) {
+          await saveToStore('video_preview_cache', videoPreviews, ownerId);
+        }
+
+        const targetItem = freshQueue.find(q => q.id === item.id);
+        if (targetItem) targetItem.status = 'success';
+
+      } catch (err) {
+        console.error(`[Ingestion Engine] Failed processing for channel ${item.title}:`, err);
+        const targetItem = freshQueue.find(q => q.id === item.id);
+        if (targetItem) targetItem.status = 'failed';
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    }));
+
+    // Save batch milestones back to storage
+    await chrome.storage.local.set({ ingestion_queue: freshQueue });
+
+    // Reactive progress messaging to open UI panels
+    const processedCount = freshQueue.filter(q => q.status !== 'pending' && q.status !== 'processing').length;
+    try {
+      chrome.runtime.sendMessage({
+        type: 'INGESTION_QUEUE_UPDATE',
+        done: processedCount,
+        total: freshQueue.length,
+        pending: freshQueue.filter(q => q.status === 'pending').length,
+        currentTitle: chunk[chunk.length - 1]?.title || '',
+        queue: freshQueue
+      });
+    } catch (_) {}
+
+    // Multi-batch cooldown delay to mimic relaxed user pacing
+    if (i + CHUNK_SIZE < pendingItems.length) {
+      await sleep(INTER_CHUNK_MS);
+    }
+  }
+
+  // Queue complete — clear alarm + final broadcast
+  try { await chrome.alarms.clear('INGESTION_QUEUE_WATCHDOG'); } catch (_) {}
+  const finalQueue   = ingestion_queue;
+  const successCount = finalQueue.filter(q => q.status === 'success').length;
+  const failedCount  = finalQueue.filter(q => q.status === 'failed').length;
+  console.log(`[Ingestion] Complete: ${successCount} success, ${failedCount} failed / ${finalQueue.length} total`);
+  try {
+    chrome.runtime.sendMessage({
+      type:    'INGESTION_QUEUE_UPDATE',
+      queue:   finalQueue,
+      done:    finalQueue.length,
+      total:   finalQueue.length,
+      pending: 0,
+      successCount,
+      failedCount,
+      currentTitle: ''
+    });
+  } catch (_) {}
+}
+
+// ── Alarm Watchdog: re-wakes SW if Chrome kills it mid-migration or mid-ingestion ──
+// Registered at top level so it survives SW restarts.
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name === 'MIGRATION_QUEUE_WATCHDOG') {
+    console.log('[MigrationQueue] Watchdog alarm fired — checking queue state...');
+    await processMigrationQueue();
+  }
+  if (alarm.name === 'INGESTION_QUEUE_WATCHDOG') {
+    console.log('[Ingestion] Watchdog alarm fired — resuming ingestion queue...');
+    await processIngestionQueue();
+  }
+});
+
 // Messaging Routing
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.action === 'GET_ACTIVE_OWNER_ID') {
+    resolveActiveOwnerId().then(ownerId => {
+      sendResponse({ 
+        activeOwnerId: ownerId, 
+        email: state.activeUserEmail,
+        channelTitle: state.activeChannelTitle
+      });
+    });
+    return true;
+  }
+
   if (message.action === 'START_STEP_1_SYNC') {
+    const ownerId = message.ownerId;
     (async () => {
       try {
-        const count = await ingestSubscriptionsFromAPI();
+        const count = await ingestSubscriptionsFromAPI(ownerId);
         sendResponse({ status: 'completed', total: count });
       } catch (error) {
         sendResponse({ status: 'failed', error: error.message });
@@ -744,9 +1262,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.action === 'START_STEP_2_SYNC') {
+    const ownerId = message.ownerId;
     (async () => {
       try {
-        const total = await syncChannelMetadata();
+        const total = await syncChannelMetadata(ownerId);
         sendResponse({ status: 'completed', total: total });
       } catch (error) {
         sendResponse({ status: 'failed', error: error.message });
@@ -755,15 +1274,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  // START_STEP_3_SYNC is deprecated — Stage 3 RSS now runs in dashboard.js
+  // Kept as a safe no-op stub for any legacy callers during transition.
   if (message.action === 'START_STEP_3_SYNC') {
-    (async () => {
-      try {
-        const total = await syncLatestVideos();
-        sendResponse({ status: 'completed', total: total });
-      } catch (error) {
-        sendResponse({ status: 'failed', error: error.message });
-      }
-    })();
+    sendResponse({ status: 'completed', total: 0 });
     return true;
   }
   
@@ -791,7 +1305,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         db.close();
 
-        chrome.alarms.create("delete_channel_" + channelId, { delayInMinutes: 5 / 60 });
+        if (chrome.alarms) {
+          chrome.alarms.create("delete_channel_" + channelId, { delayInMinutes: 5 / 60 });
+        }
         if (activeTimers[channelId]) clearTimeout(activeTimers[channelId]);
         activeTimers[channelId] = setTimeout(() => {
           executeActualDelete(channelId);
@@ -829,7 +1345,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         db.close();
 
-        chrome.alarms.clear("delete_channel_" + channelId);
+        if (chrome.alarms) {
+          chrome.alarms.clear("delete_channel_" + channelId);
+        }
         if (activeTimers[channelId]) {
           clearTimeout(activeTimers[channelId]);
           delete activeTimers[channelId];
@@ -854,9 +1372,46 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       try {
         const token = await getAuthToken(false).catch(() => null);
         if (token) {
-          await new Promise((resolve) => chrome.identity.removeCachedAuthToken({ token }, resolve));
+          await fetch(`https://oauth2.googleapis.com/revoke?token=${token}`).catch(() => {});
         }
         sendResponse({ status: 'completed' });
+      } catch (err) {
+        sendResponse({ status: 'failed', error: err.message });
+      }
+    })();
+    return true;
+  }
+
+  if (message.action === 'RESET_SESSION') {
+    const ownerIdToEvict = state.activeOwnerId;
+    memorySessionToken = null;
+    state.activeOwnerId = '';
+    state.activeUserEmail = '';
+    state.activeChannelTitle = '';
+    (async () => {
+      // Evict only this account's token from L2 — other accounts' tokens survive
+      await evictCachedToken(ownerIdToEvict);
+      chrome.storage.local.remove(['activeOwnerId', 'activeUserEmail', 'activeChannelTitle'], () => {
+        sendResponse({ status: 'completed' });
+      });
+    })();
+    return true;
+  }
+
+  if (message.action === 'TRIGGER_NEW_AUTH') {
+    const ownerIdToEvict = state.activeOwnerId;
+    memorySessionToken = null;
+    state.activeOwnerId = '';
+    state.activeUserEmail = '';
+    state.activeChannelTitle = '';
+    (async () => {
+      try {
+        await chrome.storage.local.remove(['activeOwnerId', 'activeUserEmail', 'activeChannelTitle']);
+        // Evict stale token from L2 before re-auth
+        await evictCachedToken(ownerIdToEvict);
+        const token = await getAuthToken(true);
+        const ownerId = await resolveActiveOwnerId();
+        sendResponse({ status: 'completed', activeOwnerId: ownerId });
       } catch (err) {
         sendResponse({ status: 'failed', error: err.message });
       }
@@ -867,6 +1422,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'START_SAMPLE_SYNC') {
     (async () => {
       try {
+        state.activeOwnerId = 'sample_user';
+        await chrome.storage.local.set({ activeOwnerId: 'sample_user' });
         const db = await openDB();
         
         const sampleSubs = [
@@ -885,7 +1442,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             description: 'Latest technology reviews, specs, and tutorials.',
             customUrl: '@techreviewplanet',
             thumbnail: 'https://images.unsplash.com/photo-1519389950473-47ba0277781c?auto=format&fit=crop&w=150&q=80',
-            banner: 'https://images.unsplash.com/photo-1518770660439-4636190af475?auto=format&fit=crop&w=800&q=80',
             uploadsPlaylistId: 'UU_sample_tech1',
             view_count: 1500000,
             subscriber_count: 250000,
@@ -905,7 +1461,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             description: 'Chill acoustic covers and original songs.',
             customUrl: '@acousticvibes',
             thumbnail: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?auto=format&fit=crop&w=150&q=80',
-            banner: 'https://images.unsplash.com/photo-1514525253161-7a46d19cd819?auto=format&fit=crop&w=800&q=80',
             uploadsPlaylistId: 'UU_sample_music2',
             view_count: 8900000,
             subscriber_count: 1200000,
@@ -925,7 +1480,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             description: 'Gameplay walkthroughs and reviews of classic 80s/90s games.',
             customUrl: '@retrogamingclub',
             thumbnail: 'https://images.unsplash.com/photo-1538481199705-c710c4e965fc?auto=format&fit=crop&w=150&q=80',
-            banner: 'https://images.unsplash.com/photo-1542751371-adc38448a05e?auto=format&fit=crop&w=800&q=80',
             uploadsPlaylistId: 'UU_sample_game3',
             view_count: 45000,
             subscriber_count: 3500,
@@ -945,7 +1499,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             description: 'Quick and easy home cooking recipes.',
             customUrl: '@dailychefrecipe',
             thumbnail: 'https://images.unsplash.com/photo-1556910103-1c02745aae4d?auto=format&fit=crop&w=150&q=80',
-            banner: 'https://images.unsplash.com/photo-1490645935967-10de6ba17061?auto=format&fit=crop&w=800&q=80',
             uploadsPlaylistId: 'UU_sample_cook4',
             view_count: 320000,
             subscriber_count: 48000,
@@ -965,7 +1518,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             description: 'Vlogging in various places around the world.',
             customUrl: '@abandonedvlogs',
             thumbnail: 'https://images.unsplash.com/photo-1501504905252-473c47e087f8?auto=format&fit=crop&w=150&q=80',
-            banner: 'https://images.unsplash.com/photo-1488646953014-85cb44e25828?auto=format&fit=crop&w=800&q=80',
             uploadsPlaylistId: 'UU_sample_zombie5',
             view_count: 12000,
             subscriber_count: 1500,
@@ -985,7 +1537,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             description: 'Old tech show archives.',
             customUrl: '@inactivetechnews',
             thumbnail: 'https://images.unsplash.com/photo-1498050108023-c5249f4df085?auto=format&fit=crop&w=150&q=80',
-            banner: 'https://images.unsplash.com/photo-1461749280684-dccba630e2f6?auto=format&fit=crop&w=800&q=80',
             uploadsPlaylistId: 'UU_sample_zombie6',
             view_count: 89000,
             subscriber_count: 95000,
@@ -1063,18 +1614,197 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   
-  if (message.action === 'REFRESH_VIDEOS_BATCH') {
+  // [REFRESH_VIDEOS_BATCH removed] — superseded by background ingestion queue
+
+  if (message.action === 'START_INGESTION_QUEUE') {
+    // Fire-and-forget: populate ingestion_queue from channels_master and start.
+    // Returns {status:'queued', total} immediately so the dashboard can unblock.
     (async () => {
       try {
-        const result = await refreshVideosForTop20();
-        sendResponse({ status: 'completed', count: result.count, msg: result.msg });
-      } catch (error) {
-        sendResponse({ status: 'failed', error: error.message });
+        const db = await openDB();
+        const tx = db.transaction(['channels_master'], 'readonly');
+        const allChannels = await new Promise((res) => {
+          const req = tx.objectStore('channels_master').getAll();
+          req.onsuccess = () => res(req.result || []);
+          req.onerror   = () => res([]);
+        });
+        db.close();
+
+        const targets = allChannels.filter(c =>
+          (c.status_flag === 'SUBSCRIBED' || c.status_flag === 'PENDING') &&
+          (!c.last_uploaded_at)
+        );
+
+        const ingestion_queue = targets.map(c => ({
+          id:     c.id,
+          handle: c.customUrl || c.handle || '',
+          title:  c.title || c.id,
+          status: 'pending'
+        }));
+
+        await chrome.storage.local.set({ ingestion_queue });
+        chrome.alarms.create('INGESTION_QUEUE_WATCHDOG', { periodInMinutes: 1 });
+        processIngestionQueue(); // intentionally not awaited
+        sendResponse({ status: 'queued', total: ingestion_queue.length });
+      } catch (err) {
+        console.error('[Ingestion] START_INGESTION_QUEUE error:', err);
+        sendResponse({ status: 'error', error: err.message });
+      }
+    })();
+    return true;
+  }
+
+  if (message.action === 'RESET_INGESTION_QUEUE') {
+    // Force-re-queue ALL subscribed channels regardless of existing last_uploaded_at.
+    (async () => {
+      try {
+        const db = await openDB();
+        const tx = db.transaction(['channels_master'], 'readonly');
+        const allChannels = await new Promise((res) => {
+          const req = tx.objectStore('channels_master').getAll();
+          req.onsuccess = () => res(req.result || []);
+          req.onerror   = () => res([]);
+        });
+        db.close();
+
+        const ingestion_queue = allChannels
+          .filter(c => c.status_flag === 'SUBSCRIBED' || c.status_flag === 'PENDING')
+          .map(c => ({
+            id:     c.id,
+            handle: c.customUrl || c.handle || '',
+            title:  c.title || c.id,
+            status: 'pending'
+          }));
+
+        await chrome.storage.local.set({ ingestion_queue });
+        chrome.alarms.create('INGESTION_QUEUE_WATCHDOG', { periodInMinutes: 1 });
+        processIngestionQueue(); // intentionally not awaited
+        sendResponse({ status: 'queued', total: ingestion_queue.length });
+      } catch (err) {
+        sendResponse({ status: 'error', error: err.message });
       }
     })();
     return true;
   }
   
+  // ============================================================
+  // [SWITCH_ACTIVE_ACCOUNT] — Zero-popup profile switcher
+  // Checks L2 token cache for target account. If fresh, warms
+  // L1 and updates SW state without showing Google account picker.
+  // ============================================================
+  if (message.action === 'SWITCH_ACTIVE_ACCOUNT') {
+    const { channelId, email, channelTitle } = message;
+    (async () => {
+      try {
+        const cachedToken = await loadCachedToken(channelId);
+        if (cachedToken) {
+          // L2 hit — switch account silently with no OAuth popup
+          memorySessionToken = cachedToken;
+          state.activeOwnerId = channelId;
+          state.activeUserEmail = email || '';
+          state.activeChannelTitle = channelTitle || '';
+          await chrome.storage.local.set({
+            activeOwnerId: channelId,
+            activeUserEmail: email || '',
+            activeChannelTitle: channelTitle || ''
+          });
+          sendResponse({ status: 'cached' });
+        } else {
+          // L2 miss — need fresh OAuth flow
+          memorySessionToken = null;
+          state.activeOwnerId = channelId;
+          state.activeUserEmail = email || '';
+          state.activeChannelTitle = channelTitle || '';
+          await chrome.storage.local.set({
+            activeOwnerId: channelId,
+            activeUserEmail: email || '',
+            activeChannelTitle: channelTitle || ''
+          });
+          sendResponse({ status: 'needs_auth' });
+        }
+      } catch (err) {
+        sendResponse({ status: 'needs_auth' });
+      }
+    })();
+    return true;
+  }
+
+  // ============================================================
+  // [EXECUTE_MIGRATION_CART] — Async queue enqueue (replaces blocking loop)
+  // Copies global_migration_cart into migration_queue with status:'pending',
+  // launches processMigrationQueue() in the background, and returns immediately.
+  // The dashboard tab can be safely closed during the entire migration run.
+  // ============================================================
+  if (message.action === 'EXECUTE_MIGRATION_CART') {
+    const { ownerId } = message;
+    (async () => {
+      try {
+        const data = await chrome.storage.local.get(['global_migration_cart']);
+        const cart = data.global_migration_cart || [];
+
+        if (cart.length === 0) {
+          sendResponse({ status: 'queued', total: 0 });
+          return;
+        }
+
+        // Filter out channels already SUBSCRIBED in the active account DB
+        const db = await openDB(ownerId);
+        const tx = db.transaction(['channels_master'], 'readonly');
+        const store = tx.objectStore('channels_master');
+        const allChannels = await new Promise((res) => {
+          const req = store.getAll();
+          req.onsuccess = () => res(req.result || []);
+          req.onerror  = () => res([]);
+        });
+        db.close();
+
+        const subscribedIds = new Set(
+          allChannels.filter(c => c.status_flag === 'SUBSCRIBED').map(c => c.id)
+        );
+        const pendingItems = cart.filter(item => !subscribedIds.has(item.id));
+
+        // Build the persistent queue — any existing queue is overwritten
+        const migration_queue = pendingItems.map(item => ({
+          id: item.id,
+          title: item.title || item.id,
+          status: 'pending',
+          ownerId: ownerId || ''
+        }));
+
+        await chrome.storage.local.set({ migration_queue });
+
+        // Arm the 1-minute watchdog alarm so Chrome SW sleep cannot stall the queue
+        chrome.alarms.create('MIGRATION_QUEUE_WATCHDOG', { periodInMinutes: 1 });
+
+        // Return to dashboard immediately — do NOT await the loop
+        sendResponse({ status: 'queued', total: pendingItems.length });
+
+        // Launch queue processor asynchronously
+        processMigrationQueue();
+
+      } catch (err) {
+        console.error('[MigrationQueue] Enqueue error:', err);
+        sendResponse({ status: 'failed', error: err.message });
+      }
+    })();
+    return true;
+  }
+
+  // Resume an already-queued migration (e.g. dashboard reopen, manual retry)
+  if (message.action === 'START_QUEUE_PROCESS') {
+    (async () => {
+      const { migration_queue = [] } = await chrome.storage.local.get(['migration_queue']);
+      if (migration_queue.some(q => q.status === 'pending')) {
+        chrome.alarms.create('MIGRATION_QUEUE_WATCHDOG', { periodInMinutes: 1 });
+        processMigrationQueue();
+        sendResponse({ status: 'started', total: migration_queue.length });
+      } else {
+        sendResponse({ status: 'idle' });
+      }
+    })();
+    return true;
+  }
+
   if (message.action === 'GET_SYNC_STATUS') {
     chrome.storage.local.get([
       'syncStatus', 
@@ -1098,7 +1828,7 @@ async function fetchAllSubscriptionsFromAPI() {
   let apiSubscriptions = [];
   let nextPageToken = '';
   do {
-    const url = `https://www.googleapis.com/youtube/v3/subscriptions?part=snippet&mine=true&maxResults=50${nextPageToken ? `&pageToken=${nextPageToken}` : ''}`;
+    const url = `https://www.googleapis.com/youtube/v3/subscriptions?part=snippet,contentDetails&mine=true&maxResults=50${nextPageToken ? `&pageToken=${nextPageToken}` : ''}`;
     const data = await fetchYouTubeAPI(url, false);
     if (data.items) {
       for (const item of data.items) {
@@ -1142,7 +1872,6 @@ async function reconcileSubscriptions() {
         description: item.snippet?.description || '',
         customUrl: '',
         thumbnail: thumbnail,
-        banner: '',
         uploadsPlaylistId: `UU${chId.substring(2)}`,
         view_count: 0,
         subscriber_count: 0,
@@ -1153,7 +1882,8 @@ async function reconcileSubscriptions() {
         syncedAt: new Date().toISOString(),
         last_synced_at: Date.now(),
         status_flag: 'SUBSCRIBED',
-        first_registered_at: Date.now()
+        first_registered_at: Date.now(),
+        raw_api_payload: item
       };
       store.put(newChan);
     } else {
@@ -1165,6 +1895,7 @@ async function reconcileSubscriptions() {
         local.status_flag = 'SUBSCRIBED';
         local.last_synced_at = Date.now();
       }
+      local.raw_api_payload = item;
       store.put(local);
     }
   }
@@ -1183,95 +1914,7 @@ async function reconcileSubscriptions() {
   });
   
   db.close();
+  await updateAccountLedger(state.activeOwnerId, state.activeUserEmail, state.activeChannelTitle);
 }
 
-async function refreshVideosForTop20() {
-  const db = await openDB();
-  const tx = db.transaction(['channels_master'], 'readonly');
-  const store = tx.objectStore('channels_master');
-  const allChannels = await new Promise((res) => {
-    const req = store.getAll();
-    req.onsuccess = () => res(req.result || []);
-  });
-  db.close();
-  
-  const todayStr = new Date().toISOString().split('T')[0];
-  
-  const targetChannels = allChannels.filter(c => 
-    (c.status_flag === 'SUBSCRIBED' || c.status_flag === 'PENDING') && 
-    (!c.last_video_sync_at || c.last_video_sync_at < todayStr)
-  ).slice(0, 20);
-  
-  if (targetChannels.length === 0) {
-    return { count: 0, msg: "20개 채널 업데이트 완료 (다음 청크 준비 완료)" };
-  }
-  
-  for (const ch of targetChannels) {
-    if (ch.last_video_sync_at === todayStr) continue;
-    
-    const playlistId = ch.uploadsPlaylistId || `UU${ch.id.substring(2)}`;
-    try {
-      const url = `https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId=${playlistId}&maxResults=3`;
-      const data = await fetchYouTubeAPI(url, false);
-      
-      let videoItems = [];
-      if (data.items && data.items.length > 0) {
-        const rawPublished = data.items[0].snippet?.publishedAt || data.items[0].contentDetails?.videoPublishedAt || '';
-        const last_uploaded_at = rawPublished ? new Date(rawPublished).getTime() : Date.now();
-        
-        const dbUpdate = await openDB();
-        const txCh = dbUpdate.transaction(['channels_master'], 'readwrite');
-        const chStore = txCh.objectStore('channels_master');
-        const chRecord = await new Promise((resolveCh) => {
-          const reqCh = chStore.get(ch.id);
-          reqCh.onsuccess = () => resolveCh(reqCh.result);
-          reqCh.onerror = () => resolveCh(null);
-        });
-        if (chRecord) {
-          chRecord.last_uploaded_at = last_uploaded_at;
-          chRecord.last_synced_at = Date.now();
-          chRecord.last_video_sync_at = todayStr;
-          chStore.put(chRecord);
-        }
-        txCh.oncomplete = () => dbUpdate.close();
-        txCh.onerror = () => dbUpdate.close();
-
-        videoItems = data.items.map(item => {
-          const vRawDate = item.snippet?.publishedAt || item.contentDetails?.videoPublishedAt || '';
-          const vUploadedAt = vRawDate ? new Date(vRawDate).getTime() : Date.now();
-          return {
-            id: item.snippet?.resourceId?.videoId || item.id,
-            target_channel_id: ch.id,
-            title: item.snippet?.title || '',
-            uploaded_at: vUploadedAt,
-            thumbnail: item.snippet?.thumbnails?.high?.url || item.snippet?.thumbnails?.default?.url || '',
-            syncedAt: new Date().toISOString()
-          };
-        });
-        
-        if (videoItems.length > 0) {
-          await saveToStore('video_preview_cache', videoItems);
-        }
-      } else {
-        const dbUpdate = await openDB();
-        const txCh = dbUpdate.transaction(['channels_master'], 'readwrite');
-        const chStore = txCh.objectStore('channels_master');
-        const chRecord = await new Promise((resolveCh) => {
-          const reqCh = chStore.get(ch.id);
-          reqCh.onsuccess = () => resolveCh(reqCh.result);
-          reqCh.onerror = () => resolveCh(null);
-        });
-        if (chRecord) {
-          chRecord.last_video_sync_at = todayStr;
-          chStore.put(chRecord);
-        }
-        txCh.oncomplete = () => dbUpdate.close();
-        txCh.onerror = () => dbUpdate.close();
-      }
-    } catch (err) {
-      console.warn(`Failed to sync videos for channel ${ch.title}:`, err);
-    }
-  }
-  
-  return { count: targetChannels.length, msg: "20개 채널 업데이트 완료 (다음 청크 준비 완료)" };
-}
+// [refreshVideosForTop20 removed] — superseded by processIngestionQueue()

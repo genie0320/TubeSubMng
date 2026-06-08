@@ -529,14 +529,6 @@ body {
   box-shadow: 0 30px 60px rgba(0, 0, 0, 0.6);
 }
 
-.modal-banner {
-  height: 120px;
-  background: linear-gradient(135deg, rgba(230, 57, 70, 0.2), rgba(214, 34, 70, 0.1));
-  background-size: cover;
-  background-position: center;
-  position: relative;
-}
-
 .modal-close-btn {
   position: absolute;
   top: 16px;
@@ -563,6 +555,7 @@ body {
 
 .modal-body-content {
   padding: 24px;
+  padding-top: 36px;
   overflow-y: auto;
   flex: 1;
   display: flex;
@@ -574,7 +567,6 @@ body {
   display: flex;
   align-items: center;
   gap: 16px;
-  margin-top: -50px;
   position: relative;
   z-index: 5;
 }
@@ -601,7 +593,7 @@ body {
 }
 
 .modal-titles {
-  padding-top: 35px;
+  padding-top: 0;
 }
 
 .modal-titles h3 {
@@ -730,6 +722,40 @@ body {
   color: #38b000;
 }
 
+/* ── [분석 대기 중] pending-analysis badge ─────────────────────────────── */
+.neglect-tag.pending-analysis {
+  background: rgba(150, 150, 160, 0.18);
+  color: rgba(200, 200, 210, 0.75);
+  border: 1px solid rgba(180, 180, 190, 0.2);
+  animation: skeleton-pulse 1.8s ease-in-out infinite;
+}
+
+/* ── Skeleton shimmer row (masks unanalyzed channel stat lines) ─────────── */
+.skeleton-row {
+  height: 11px;
+  border-radius: 6px;
+  background: linear-gradient(
+    90deg,
+    rgba(255,255,255,0.04) 0%,
+    rgba(255,255,255,0.11) 50%,
+    rgba(255,255,255,0.04) 100%
+  );
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.6s linear infinite;
+  width: 80%;
+}
+
+/* ── Keyframe animations ────────────────────────────────────────────────── */
+@keyframes skeleton-pulse {
+  0%, 100% { opacity: 0.55; }
+  50%       { opacity: 1.0;  }
+}
+
+@keyframes skeleton-shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
 /* Sidebar sliding transition styling */
 .sidebar {
   width: 280px;
@@ -774,11 +800,88 @@ body {
 }
 
 /* Horizontal video lists styling inside modal */
-.modal-video-item {
+.video-item {
   transition: transform 0.2s ease, background-color 0.2s ease;
 }
-.modal-video-item:hover {
+.video-item:hover {
   transform: scale(1.01);
 }
 
+/* Skeleton loader for profile stringDisplay */
+@keyframes pulse {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 0.3; }
+}
+.skeleton-text {
+  display: inline-block;
+  width: 150px;
+  height: 12px;
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+  animation: pulse 1.5s infinite ease-in-out;
+}
 
+/* Suggest dynamic refresh for out-of-date calendar sync */
+.refresh-suggested {
+  position: relative;
+}
+.refresh-suggested::after {
+  content: '';
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: block;
+  width: 8px;
+  height: 8px;
+  background-color: #ffb703;
+  border-radius: 50%;
+  box-shadow: 0 0 8px #ffb703;
+}
+
+#select-active-profile option {
+  background-color: #141418;
+  color: #f8f9fa;
+  font-family: inherit;
+}
+#select-active-profile option:hover {
+  background: var(--accent-gradient);
+}
+
+/* Migration Execution Panel — Tab 3 */
+@keyframes migPanelIn {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+#migration-execution-panel {
+  animation: migPanelIn 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+#btn-run-migration:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 20px rgba(255, 183, 3, 0.5) !important;
+}
+
+#btn-run-migration:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Session badge z-index uplift — prevent card scroll overlap */
+#session-profile-badge {
+  z-index: 50 !important;
+}
+
+/* Sticky content header so badge anchor stays above card grid */
+.content-header {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  background: var(--panel-bg);
+}

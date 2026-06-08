@@ -7,20 +7,14 @@
   "permissions": [
     "identity",
     "storage",
-    "declarativeNetRequest",
     "alarms"
   ],
   "host_permissions": [
-    "https://www.googleapis.com/*"
+    "https://www.googleapis.com/*",
+    "https://www.youtube.com/*"
   ],
   "background": {
     "service_worker": "background.js"
-  },
-  "oauth2": {
-    "client_id": "733686128763-hhnk6t5ff0om5if9ma21efd23ok18sfu.apps.googleusercontent.com",
-    "scopes": [
-      "https://www.googleapis.com/auth/youtube"
-    ]
   },
   "action": {
     "default_popup": "popup/popup.html"

@@ -55,11 +55,11 @@
       <!-- Step 3 Card -->
       <div class="pipeline-card disabled" id="step-3-card" style="background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.06); border-radius: 16px; padding: 20px; margin-bottom: 16px; opacity: 0.35;">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-          <h3 style="font-size: 14px; font-weight: 700; margin: 0;">3단계: 최신 활동 데이터 수집</h3>
-          <span style="font-size: 10px; background: rgba(255, 255, 255, 0.08); padding: 3px 8px; border-radius: 6px; color: rgba(255, 255, 255, 0.6); font-weight: 700; letter-spacing: 0.5px;">활동 분석</span>
+          <h3 style="font-size: 14px; font-weight: 700; margin: 0;">3단계: 백그라운드 채널 활동 분석</h3>
+          <span style="font-size: 10px; background: rgba(56, 176, 0, 0.15); padding: 3px 8px; border-radius: 6px; color: #38b000; font-weight: 700; letter-spacing: 0.5px;">0 쿼터</span>
         </div>
-        <p style="font-size: 11px; color: rgba(255, 255, 255, 0.5); margin-bottom: 12px; line-height: 1.5;">각 채널의 최신 동영상 3개 업로드 타임스탬프를 가져와 유령 채널 여부를 검출합니다.</p>
-        <button class="action-btn" id="tm-step3-start" style="width: 100%; padding: 10px; font-size: 13px;">최신 활동 데이터 수집</button>
+        <p style="font-size: 11px; color: rgba(255, 255, 255, 0.5); margin-bottom: 12px; line-height: 1.5;">ytInitialData 스크래핑 + YouTube RSS 피드를 통해 각 채널의 최종 업로드 날짜를 수집합니다. API 쿼터를 전혀 소모하지 않습니다. 탭을 닫아도 백그라운드에서 계속 실행됩니다. (최대 8개 병렬 처리)</p>
+        <button class="action-btn" id="tm-step3-start" style="width: 100%; padding: 10px; font-size: 13px;">RSS 기반 활동 분석 시작</button>
         
         <div id="step3-progress-area" style="display: none; margin-top: 10px;">
           <div class="progress-bar-container">
@@ -124,15 +124,34 @@
 
       <div class="sidebar-footer" style="display: flex; flex-direction: column; gap: 8px;">
         <button class="action-btn secondary-btn" id="btn-refresh-subs" style="width: 100%; font-size: 11px; padding: 10px;">[구독채널목록 새로고침]</button>
-        <button class="action-btn secondary-btn" id="btn-refresh-videos" style="width: 100%; font-size: 11px; padding: 10px;">[채널별 영상정보 새로고침 (20개 채널)]</button>
+        <button class="action-btn secondary-btn" id="btn-full-resync" style="width: 100%; font-size: 11px; padding: 10px;">[전체 채널 고속 동기화]</button>
         <button class="action-btn" id="tm-reset-pipeline-sidebar" style="width: 100%; font-size: 11px; padding: 10px; background: rgba(230, 57, 70, 0.1); border: 1px solid rgba(230, 57, 70, 0.3); color: #E63946; box-shadow: none; margin: 0;">파이프라인 전체 초기화</button>
         <button class="danger-btn" id="bulk-unsub-btn" disabled>선택 채널 구독 취소</button>
+        <button class="action-btn" id="bulk-migrate-btn" style="width: 100%; margin: 0; padding: 10px; font-size: 11px;" disabled>선택 채널 이전 카트에 담기</button>
+
+        <!-- Snapshot Ledger Controls -->
+        <div style="border-top: 1px solid rgba(255,255,255,0.06); margin-top: 4px; padding-top: 8px; display: flex; flex-direction: column; gap: 6px;">
+          <button class="action-btn secondary-btn" id="btn-ledger-export" style="width: 100%; font-size: 11px; padding: 10px;">[데이터 백업 (.json)]</button>
+          <button class="action-btn secondary-btn" id="btn-ledger-import" style="width: 100%; font-size: 11px; padding: 10px;">[데이터 복구]</button>
+          <input type="file" id="ledger-import-input" accept=".json" style="display: none;" aria-hidden="true">
+        </div>
       </div>
     </aside>
 
     <!-- Main Content Right Section -->
-    <main class="main-content" id="main-content">
-      <header class="content-header glass-card">
+    <main class="main-content" id="main-content" style="position: relative;">
+      <!-- Top-Right Session Profile Badge -->
+      <div id="session-profile-badge" style="position: absolute; top: 16px; right: 24px; display: flex; align-items: center; gap: 8px; background: rgba(30, 30, 35, 0.9); border: 1px solid rgba(255, 255, 255, 0.15); border-radius: 20px; padding: 6px 14px; font-family: inherit; font-size: 11px; color: rgba(255, 255, 255, 0.85); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); z-index: 10;">
+        <select id="select-active-profile" style="background: transparent; border: none; color: white; font-family: inherit; font-size: 11px; font-weight: 700; outline: none; cursor: pointer; max-width: 250px; padding-right: 8px;">
+          <!-- Options dynamically populated -->
+        </select>
+        <button id="btn-session-reset" style="background: none; border: none; color: #e63946; cursor: pointer; display: flex; align-items: center; padding: 2px; transition: opacity 0.2s; outline: none;" title="세션 초기화 및 로그아웃">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>
+          </svg>
+        </button>
+      </div>
+      <header class="content-header glass-card" style="padding-top: 50px; position: relative;">
         <div class="header-left" style="display: flex; align-items: flex-start; gap: 12px;">
           <!-- Toggle sidebar button -->
           <button id="sidebar-toggle-btn" class="secondary-btn" style="padding: 10px; margin: 0; display: flex; align-items: center; justify-content: center; border-radius: 12px; cursor: pointer;" aria-label="Toggle Sidebar">
@@ -163,11 +182,29 @@
       </header>
 
       <!-- Channels Card Grid -->
-      <section class="channels-section">
-        <div class="tabs-wrapper" style="display: flex; gap: 16px; margin-bottom: 16px; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 8px;">
-          <button class="tab-btn active" id="tab-active-subs" style="background: none; border: none; color: white; font-weight: bold; cursor: pointer; padding-bottom: 4px; border-bottom: 2px solid #e63946; font-size: 14px; outline: none;">현재 구독 리스트</button>
-          <button class="tab-btn" id="tab-history-subs" style="background: none; border: none; color: rgba(255,255,255,0.5); font-weight: bold; cursor: pointer; padding-bottom: 4px; font-size: 14px; outline: none;">구독 취소 히스토리</button>
+      <section class="channels-section" style="position: relative; min-height: 400px;">
+        <!-- Onboarding Overlay for empty states -->
+        <div id="onboarding-overlay" style="display: none; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: rgba(10, 10, 12, 0.85); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); z-index: 100; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 40px; border-radius: 16px;">
+          <h2 style="font-size: 20px; font-weight: 800; color: #fff; margin-bottom: 12px; background: linear-gradient(135deg, #FFB703, #FB8500); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">새로운 관리 계정이 감지되었습니다.</h2>
+          <p style="font-size: 13px; color: rgba(255, 255, 255, 0.7); max-width: 480px; margin-bottom: 24px; line-height: 1.6;">유령 채널 분석 및 구독 이민 카트 기능을 활성화하려면 최초 1회 데이터 동기화 파이프라인 가동이 필요합니다. (약 10~30초 소요)</p>
+          <button class="action-btn" id="btn-start-onboarding" style="padding: 12px 28px; font-size: 14px; font-weight: 700; border-radius: 8px;">[초기 분석 파이프라인 시작]</button>
         </div>
+        <div class="tabs-wrapper" style="display: flex; gap: 16px; margin-bottom: 16px; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 8px;">
+          <button class="tab-btn active" id="tab-active-subs" style="background: none; border: none; color: white; font-weight: bold; cursor: pointer; padding-bottom: 4px; border-bottom: 2px solid #e63946; font-size: 14px; outline: none;">[현재 구독 리스트]</button>
+          <button class="tab-btn" id="tab-history-subs" style="background: none; border: none; color: rgba(255,255,255,0.5); font-weight: bold; cursor: pointer; padding-bottom: 4px; font-size: 14px; outline: none;">[구독 취소 히스토리]</button>
+          <button class="tab-btn" id="tab-migration-subs" style="background: none; border: none; color: rgba(255,255,255,0.5); font-weight: bold; cursor: pointer; padding-bottom: 4px; font-size: 14px; outline: none;">[신규구독할 채널]</button>
+        </div>
+        <div id="migration-chips-container" style="display: none; flex-direction: row; overflow-x: auto; gap: 8px; margin-bottom: 16px; padding-bottom: 8px; white-space: nowrap; -webkit-overflow-scrolling: touch;"></div>
+
+        <!-- Migration Execution Panel (visible only in Tab 3) -->
+        <div id="migration-execution-panel" style="display: none; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 18px; margin-bottom: 14px; background: rgba(255, 183, 3, 0.05); border: 1px solid rgba(255, 183, 3, 0.18); border-radius: 14px; animation: migPanelIn 0.3s ease;">
+          <div style="display: flex; flex-direction: column; gap: 4px; min-width: 0;">
+            <span style="font-size: 13px; font-weight: 800; color: #FFB703;">&#x1F6D2; 구독 이전 카트</span>
+            <span id="migration-run-status" style="font-size: 11px; color: rgba(255,255,255,0.5); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">카트에 담긴 채널을 새 계정에 일괄 구독합니다. (1.5초 간격 순차 실행)</span>
+          </div>
+          <button id="btn-run-migration" style="background: linear-gradient(135deg, #FFB703, #FB8500); border: none; border-radius: 10px; color: white; padding: 10px 22px; font-size: 12px; font-weight: 800; cursor: pointer; white-space: nowrap; flex-shrink: 0; box-shadow: 0 4px 14px rgba(255,183,3,0.35); transition: all 0.2s ease;">[구독 이전 실행]</button>
+        </div>
+
         <div class="grid-controls">
           <div class="select-all-wrapper">
             <input type="checkbox" id="select-all-checkbox">
@@ -184,6 +221,17 @@
           </div>
         </div>
         
+        <!-- Ingestion Background Progress Strip -->
+        <div id="ingestion-progress-area" style="display: none; padding: 10px 16px; margin-bottom: 12px; background: rgba(76, 201, 240, 0.05); border: 1px solid rgba(76, 201, 240, 0.18); border-radius: 12px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+            <span id="ingestion-progress-status" style="font-size: 11px; color: rgba(255,255,255,0.6); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">백그라운드 분석 중...</span>
+            <span style="font-size: 10px; color: #4cc9f0; font-weight: 700; flex-shrink: 0; margin-left: 8px;">⟳ 백그라운드</span>
+          </div>
+          <div id="ingestion-progress-bar-track" style="height: 3px; background: rgba(255,255,255,0.08); border-radius: 2px;">
+            <div id="ingestion-progress-bar-fill" style="height: 100%; width: 0%; background: linear-gradient(90deg, #4cc9f0, #7209b7); border-radius: 2px; transition: width 0.4s ease;"></div>
+          </div>
+        </div>
+
         <div class="channels-grid" id="channels-grid">
           <!-- Dynamically populated channel cards -->
         </div>
@@ -194,7 +242,6 @@
   <!-- Channel Detail Modal -->
   <div id="channel-modal" class="modal-overlay" style="display: none;">
     <div class="glass-card modal-content">
-      <div class="modal-banner" id="modal-banner"></div>
       <button class="modal-close-btn" id="modal-close-btn" aria-label="Close modal">&times;</button>
       <div class="modal-body-content">
         <div class="modal-header-profile">
@@ -232,7 +279,7 @@
 
         <!-- Horizontal list component for latest 3 videos -->
         <div class="modal-info-section">
-          <h4 style="margin-bottom: 8px;">최신 업로드 영상 리스트 (최대 3개)</h4>
+          <h4 style="margin-bottom: 8px;">크리에이터의 마지막 발자취 (최종 영상 3개)</h4>
           <div class="modal-video-preview-list" id="modal-video-preview-list" style="display: flex; flex-direction: column; gap: 8px;">
             <!-- Dynamically populated vertical lists of horizontal items -->
           </div>
